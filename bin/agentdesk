@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# agentdesk —— 给 agent 用的独立无头 X 桌面（Fedora 零安装版：Xvfb/x11vnc/openbox/xdotool
+# 全部来自本地解包的 RPM，装在 ~/.local/agentdesk/root，不写 /usr、不要 sudo）。
+# 用法见 `agentdesk help`。
+set -u
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+AD_HOME="$(cd "$(dirname "$SELF")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$AD_HOME/etc/agentdesk.conf"
+
+export PATH="$AD_ROOT/bin:$PATH"
+export LD_LIBRARY_PATH="$AD_ROOT/lib64:$AD_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export DISPLAY="$AD_DISPLAY"
+# 关键：撤掉 Wayland 会话痕迹，否则 x11vnc 误判为 Wayland 直接退出、GTK 应用也往 wayland 跑
+unset WAYLAND_DISPLAY XDG_SESSION_TYPE
+export XDG_DATA_DIRS="$AD_ROOT/share:${XDG_DATA_DIRS:-/usr/share}"
+export XDG_CONFIG_DIRS="$AD_HOME/etc:${XDG_CONFIG_DIRS:-/etc/xdg}"
+export GDK_BACKEND="${GDK_BACKEND:-x11}"
+export MOZ_ENABLE_WAYLAND=0
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+
+LOG="$AD_VAR/log"; PID="$AD_VAR/pid"; SHOTS="$AD_VAR/shots"
+mkdir -p "$LOG" "$PID" "$SHOTS"
+IDLE="$AD_VAR/last-activity"; FROZEN_STATE="$AD_VAR/frozen"
+
+die() { echo "agentdesk: $*" >&2; exit 1; }
+alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+# ---- 空闲冻结：卡住的桌面不占 CPU，动作时自动解冻 ----
+touch_activity() { date +%s >"$IDLE"; }
+is_frozen() { [ -f "$FROZEN_STATE" ]; }
+
+pgids() { # 本桌面所有进程组 id（组件 + app），每行一个；setsid 起，pgid=pid
+  local f p
+  for f in xvfb wm vnc web; do
+    [ -f "$PID/$f.pid" ] && p=$(cat "$PID/$f.pid" 2>/dev/null) && [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
+  done
+  if [ -f "$APPS" ]; then
+    while IFS=$'\t' read -r p _ _; do
+      [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
+    done <"$APPS"
+  fi
+  return 0
+}
+
+freeze() {
+  if is_frozen; then echo "already frozen"; return 0; fi
+  local ids p n=0
+  ids=$(pgids)
+  [ -n "$ids" ] || { echo "没有在跑的进程，无需冻结"; return 0; }
+  : >"$FROZEN_STATE"
+  for p in $ids; do
+    kill -STOP -- "-$p" 2>/dev/null || kill -STOP "$p" 2>/dev/null
+    echo "$p" >>"$FROZEN_STATE"
+    n=$((n+1))
+  done
+  echo "frozen: $n 组进程已暂停（agentdesk thaw 恢复）"
+}
+
+thaw() { # [--quiet]
+  is_frozen || return 0
+  local p
+  while read -r p; do
+    [ -n "$p" ] || continue
+    kill -CONT -- "-$p" 2>/dev/null || kill -CONT "$p" 2>/dev/null
+  done <"$FROZEN_STATE"
+  /usr/bin/rm -f "$FROZEN_STATE"   # 内部状态文件，不进备份区
+  touch_activity
+  [ "${1:-}" = "--quiet" ] || echo "thawed"
+  return 0
+}
+
+idle_check() { # 超过 AD_IDLE_FREEZE_SEC 无操作就冻结；有旁观者视为在用
+  if is_frozen; then echo "already frozen"; return 0; fi
+  alive "$PID/xvfb.pid" || { echo "desktop not running"; return 0; }
+  local secs="${AD_IDLE_FREEZE_SEC:-3600}" now last idle
+  now=$(date +%s)
+  last=$(cat "$IDLE" 2>/dev/null || echo "$now")
+  if ss -Htn state established "( sport = :$AD_VNC_PORT )" 2>/dev/null | grep -q .; then
+    touch_activity
+    echo "viewer connected; idle reset"
+    return 0
+  fi
+  idle=$((now-last))
+  if [ "$idle" -ge "$secs" ]; then
+    freeze
+    echo "idle=${idle}s >= ${secs}s"
+  else
+    echo "idle=${idle}s < ${secs}s"
+  fi
+}
+
+wait_ready() { # 等 X 服务器可响应
+  local i
+  for i in $(seq 1 60); do
+    xdotool getdisplaygeometry >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+start_component() { # name cmd...
+  local name="$1"; shift
+  if alive "$PID/$name.pid"; then return 0; fi
+  setsid "$@" >"$LOG/$name.log" 2>&1 &
+  echo $! >"$PID/$name.pid"
+}
+
+start() { # [--quiet]
+  local quiet=0; [ "${1:-}" = "--quiet" ] && quiet=1
+  is_frozen && thaw --quiet
+  if ! alive "$PID/xvfb.pid"; then
+    start_component xvfb "$AD_ROOT/bin/Xvfb" "$AD_DISPLAY" -screen 0 "$AD_GEOMETRY" \
+      -dpi "$AD_DPI" -nolisten tcp -noreset
+    wait_ready || die "Xvfb 起不来，见 $LOG/xvfb.log"
+  fi
+  wait_ready || die "display $AD_DISPLAY 不可用"
+  # 根窗口底色不设：本机无 xsetroot/feh，ImageMagick display 会常驻阻塞（黑底不影响截图）
+  start_component wm "$AD_ROOT/bin/openbox" --sm-disable --config-file "$AD_HOME/etc/openbox/rc.xml"
+  start_component vnc "$AD_ROOT/bin/x11vnc" -display "$AD_DISPLAY" -rfbport "$AD_VNC_PORT" \
+    -localhost -nopw -forever -shared -noxdamage -nolookup -quiet
+  start_component web python3 -m websockify --web="$AD_NOVNC" \
+    "$AD_BIND:$AD_WEB_PORT" "127.0.0.1:$AD_VNC_PORT"
+  sleep 0.6
+  touch_activity
+  [ "$quiet" -eq 0 ] && status
+  return 0
+}
+
+stop() {
+  local f
+  is_frozen && thaw --quiet
+  for f in web vnc wm xvfb; do
+    if alive "$PID/$f.pid"; then
+      pkill -TERM -P "$(cat "$PID/$f.pid")" 2>/dev/null
+      kill -TERM "$(cat "$PID/$f.pid")" 2>/dev/null
+    fi
+    /usr/bin/rm -f "$PID/$f.pid"
+  done
+  sleep 0.5
+  pkill -KILL -f "Xvfb $AD_DISPLAY" 2>/dev/null
+  pkill -KILL -f "x11vnc -display $AD_DISPLAY" 2>/dev/null
+  echo "agentdesk stopped"
+}
+
+status() {
+  local f s
+  printf '%-8s %-6s %s\n' NAME PID STATE
+  for f in xvfb wm vnc web; do
+    if alive "$PID/$f.pid"; then s="up"; else s="down"; fi
+    printf '%-8s %-6s %s\n' "$f" "$([ -f "$PID/$f.pid" ] && cat "$PID/$f.pid" || echo -)" "$s"
+  done
+  if is_frozen; then
+    echo "frozen  : YES ($(( $(wc -l <"$FROZEN_STATE") )) 组进程已暂停；任意动作或 thaw 解冻)"
+  else
+    echo "frozen  : no   idle $(( $(date +%s) - $(cat "$IDLE" 2>/dev/null || date +%s) ))s / ${AD_IDLE_FREEZE_SEC:-3600}s"
+  fi
+  echo "display: $AD_DISPLAY  geometry: $AD_GEOMETRY"
+  echo "viewer : http://$AD_BIND:$AD_WEB_PORT/vnc.html   (VNC raw: $AD_BIND:$AD_VNC_PORT)"
+}
+
+shot() { # [outfile] [--scale 0.5]
+  local out="${SHOTS}/latest.png" scale=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --scale) scale="$2"; shift 2 ;;
+      *) out="$1"; shift ;;
+    esac
+  done
+  import -window root "$out" || die "截屏失败（display $AD_DISPLAY 活着吗？）"
+  [ -n "$scale" ] && magick "$out" -resize "${scale}%" "$out"
+  echo "$out"
+}
+
+windows() {
+  # 用 EWMH 客户端列表，比 xdotool search 干净（不带内部辅助窗口）
+  local id active geom mark
+  active=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | grep -o '0x[0-9a-f]*')
+  printf '%-12s %-10s %s\n' WINDOWID GEOM TITLE
+  for id in $(xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -o '0x[0-9a-f]*'); do
+    geom=$(xdotool getwindowgeometry --shell "$id" 2>/dev/null | awk -F= '/WIDTH/{w=$2}/HEIGHT/{h=$2}END{print w"x"h}')
+    [ "$id" = "$active" ] && mark="*" || mark=" "
+    printf '%-12s %-10s %s%s\n' "$id" "$geom" "$mark" "$(xdotool getwindowname "$id" 2>/dev/null)"
+  done
+}
+
+APPS="$AD_VAR/apps.tsv"
+
+app() { # 在 :99 上起一个 GUI 程序，返回 pid（记入 var/apps.tsv 便于清理）
+  [ $# -ge 1 ] || die "用法: agentdesk app <command...>"
+  setsid "$@" >"$LOG/app.log" 2>&1 &
+  local pid=$!
+  printf '%s\t%s\t%s\n' "$pid" "$(date +%H:%M:%S)" "$*" >>"$APPS"
+  echo "pid=$pid log=$LOG/app.log"
+}
+
+apps() { # 列出本工具拉起的程序，并顺手清掉已退出的记录
+  printf '%-8s %-9s %s\n' PID START CMD
+  [ -f "$APPS" ] || return 0
+  local pid ts cmd
+  : >"$APPS.tmp"
+  while IFS=$'\t' read -r pid ts cmd; do
+    kill -0 "$pid" 2>/dev/null || continue
+    printf '%-8s %-9s %s\n' "$pid" "$ts" "$cmd"
+    printf '%s\t%s\t%s\n' "$pid" "$ts" "$cmd" >>"$APPS.tmp"
+  done <"$APPS"
+  mv "$APPS.tmp" "$APPS"
+}
+
+kill_app() { # kill-app <pid|all> —— 只杀 app 记过的，不碰用户自己的进程
+  local target="${1:-all}" pid ts cmd killed=0
+  [ -f "$APPS" ] || die "没有记录（var/apps.tsv 不存在）"
+  : >"$APPS.tmp"
+  while IFS=$'\t' read -r pid ts cmd; do
+    if ! kill -0 "$pid" 2>/dev/null; then continue; fi
+    if [ "$target" = all ] || [ "$target" = "$pid" ]; then
+      kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+      echo "killed pid=$pid  $cmd"; killed=$((killed+1))
+    else
+      printf '%s\t%s\t%s\n' "$pid" "$ts" "$cmd" >>"$APPS.tmp"
+    fi
+  done <"$APPS"
+  mv "$APPS.tmp" "$APPS"
+  echo "共 $killed 个"
+}
+
+paste() { # 中文等非 ASCII 一律走剪贴板 + Ctrl+V
+  [ $# -eq 1 ] || die "用法: agentdesk paste <text>"
+  printf '%s' "$1" | xclip -selection clipboard -display "$AD_DISPLAY" -i
+  sleep 0.15
+  xdotool key --clearmodifiers ctrl+v
+}
+
+watch() {
+  start --quiet
+  local up=0 i
+  for i in $(seq 1 40); do
+    curl -sf -o /dev/null "http://$AD_BIND:$AD_WEB_PORT/vnc.html" && { up=1; break; }
+    sleep 0.25
+  done
+  [ "$up" -eq 1 ] || die "noVNC 没起来，见 $LOG/web.log"
+  echo "http://$AD_BIND:$AD_WEB_PORT/vnc.html"
+  [ "${1:-}" = "--open" ] && xdg-open "http://$AD_BIND:$AD_WEB_PORT/vnc.html" >/dev/null 2>&1
+  return 0
+}
+
+service() { # enable|disable|status —— systemd --user 常驻 + 空闲冻结 timer（无窗口）
+  local unit="$HOME/.config/systemd/user/agentdesk.service"
+  local timer="$HOME/.config/systemd/user/agentdesk-idle.timer"
+  local idleunit="$HOME/.config/systemd/user/agentdesk-idle.service"
+  case "${1:-status}" in
+    enable)
+      mkdir -p "$(dirname "$unit")"
+      cat >"$unit" <<EOF
+[Unit]
+Description=agentdesk headless X11 desktop (Xvfb + x11vnc + noVNC)
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SELF start --quiet
+ExecStop=$SELF stop
+
+[Install]
+WantedBy=default.target
+EOF
+      cat >"$idleunit" <<EOF
+[Unit]
+Description=agentdesk idle freeze check
+
+[Service]
+Type=oneshot
+ExecStart=$SELF idle-check
+EOF
+      cat >"$timer" <<EOF
+[Unit]
+Description=agentdesk idle freeze timer (every ${AD_IDLE_CHECK_SEC:-300}s)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${AD_IDLE_CHECK_SEC:-300}s
+AccuracySec=30s
+Unit=agentdesk-idle.service
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl --user daemon-reload
+      systemctl --user enable --now agentdesk.service agentdesk-idle.timer && echo "agentdesk.service + agentdesk-idle.timer enabled"
+      ;;
+    disable)
+      systemctl --user disable --now agentdesk-idle.timer agentdesk.service 2>/dev/null
+      echo "agentdesk.service + agentdesk-idle.timer disabled"
+      ;;
+    status)
+      systemctl --user status agentdesk.service --no-pager 2>&1 | head -8
+      systemctl --user list-timers agentdesk-idle.timer --no-pager 2>&1 | head -5
+      ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+agentdesk —— 独立无头 X 桌面（不影响真实桌面）
+
+  start [--quiet]        起 Xvfb + openbox + x11vnc + noVNC
+  stop                   全停
+  status                 各组件状态 + 旁观地址
+  watch [--open]         确保旁观通道就绪，打印 http://127.0.0.1:6080/vnc.html
+  freeze                 立即冻结整块桌面（SIGSTOP，保留现场、CPU 归零）
+  thaw                   解冻（任何动作命令也会自动解冻）
+  idle-check             空闲检查：超 AD_IDLE_FREEZE_SEC 自动冻结（timer 定时调用）
+  shot [out.png] [--scale N]   全屏截图（默认 var/shots/latest.png）
+  windows                列出可见窗口（id / 尺寸 / 标题，* = 当前焦点）
+  app <cmd...>           在桌面上启动 GUI 程序（pid 记入 var/apps.tsv）
+  apps                   列出/清理已退出记录
+  kill-app <pid|all>     只杀本工具拉起的程序（不碰用户自己的）
+  move X Y | click X Y [--button N] [--count N]
+  drag X1 Y1 X2 Y2 | scroll up|down N [--at X Y]
+  type <ascii>           键入 ASCII 文本
+  paste <text>           非 ASCII（中文等）走剪贴板 + Ctrl+V
+  key <xdotool键名>      如: key ctrl+l / key Return / key alt+Tab
+  clip get|set <text>    剪贴板读写（:99 内部）
+  service enable|disable|status   systemd --user 常驻自启 + 空闲冻结 timer（无窗口）
+  run <cmd...>           在桌面环境变量下执行任意命令
+EOF
+}
+
+# 除纯状态/管理命令外，任何动作先解冻并刷新空闲计时
+case "${1:-help}" in
+  status|help|-h|--help|service|idle-check|freeze|thaw|stop) ;;
+  *) is_frozen && thaw --quiet; touch_activity ;;
+esac
+
+case "${1:-help}" in
+  freeze) freeze ;;
+  thaw) thaw ;;
+  idle-check) idle_check ;;
+  start) shift; start "$@" ;;
+  stop) stop ;;
+  status) status ;;
+  watch) shift; watch "${1:-}" ;;
+  shot) shift; shot "$@" ;;
+  windows) windows ;;
+  app) shift; app "$@" ;;
+  apps) apps ;;
+  kill-app) shift; kill_app "$@" ;;
+  move) shift; xdotool mousemove "$1" "$2" ;;
+  click)
+    shift; x=1; y=2; btn=1; cnt=1
+    pos=(); while [ $# -gt 0 ]; do case "$1" in
+      --button) btn="$2"; shift 2 ;; --count) cnt="$2"; shift 2 ;; *) pos+=("$1"); shift ;;
+    esac; done
+    xdotool mousemove "${pos[0]}" "${pos[1]}" click --repeat "$cnt" "$btn" ;;
+  drag) shift; xdotool mousemove "$1" "$2" mousedown 1 mousemove --sync "$3" "$4" mouseup 1 ;;
+  scroll)
+    shift; dir="$1"; n="${2:-3}"; key=4; [ "$dir" = down ] && key=5
+    if [ "${3:-}" = "--at" ]; then xdotool mousemove "$4" "$5"; fi
+    xdotool click --repeat "$n" "$key" ;;
+  type) shift; xdotool type --clearmodifiers --delay 12 -- "$*" ;;
+  paste) shift; paste "$*" ;;
+  key) shift; xdotool key --clearmodifiers "$@" ;;
+  clip)
+    shift
+    case "${1:-get}" in
+      get) xclip -selection clipboard -o -display "$AD_DISPLAY" ;;
+      set) shift; printf '%s' "$1" | xclip -selection clipboard -display "$AD_DISPLAY" -i ;;
+      *) die "用法: agentdesk clip get|set <text>" ;;
+    esac ;;
+  service) shift; service "${1:-status}" ;;
+  run) shift; "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac
