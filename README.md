@@ -17,7 +17,7 @@ A **rootless, headless X11 desktop for AI agents** on Fedora — Xvfb + openbox 
 ## 安装（Fedora）
 
 ```bash
-git clone https://github.com/<you>/agentdesk.git
+git clone https://github.com/cv588888888888888888888ju/agentdesk.git
 cd agentdesk
 bash etc/install.sh        # dnf download + 解包 + pip install websockify
 agentdesk start            # 起 :99
