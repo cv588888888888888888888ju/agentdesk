@@ -20,6 +20,20 @@ export GDK_BACKEND="${GDK_BACKEND:-x11}"
 export MOZ_ENABLE_WAYLAND=0
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 
+# ---- GPU 渲染（AD_GPU=zink|auto|off）：只换 GL 后端，截图/输入链路不变 ----
+gpu_env() {
+  case "${AD_GPU:-off}" in
+    off|0|"") return 0 ;;
+    auto) ls "${AD_VK_ICD_DIR:-/usr/share/vulkan/icd.d}"/*.json >/dev/null 2>&1 || return 0 ;;
+  esac
+  export GALLIUM_DRIVER=zink
+  export LIBGL_ALWAYS_SOFTWARE=0
+  unset MESA_LOADER_DRIVER_OVERRIDE
+  [ -n "${AD_GPU_ICD:-}" ] && export VK_ICD_FILENAMES="$AD_GPU_ICD"
+  return 0
+}
+gpu_env
+
 LOG="$AD_VAR/log"; PID="$AD_VAR/pid"; SHOTS="$AD_VAR/shots"
 mkdir -p "$LOG" "$PID" "$SHOTS"
 IDLE="$AD_VAR/last-activity"; FROZEN_STATE="$AD_VAR/frozen"
@@ -89,6 +103,12 @@ idle_check() { # 超过 AD_IDLE_FREEZE_SEC 无操作就冻结；有旁观者视�
   else
     echo "idle=${idle}s < ${secs}s"
   fi
+}
+
+gpu() { # 显示当前 GL 后端实测结果（改 AD_GPU 后重启 CLI 生效）
+  echo "AD_GPU=${AD_GPU:-off}  AD_GPU_ICD=${AD_GPU_ICD:-default}  DISPLAY=$DISPLAY"
+  command -v glxinfo >/dev/null 2>&1 || { echo "(no glxinfo)"; return 0; }
+  glxinfo -B 2>/dev/null | grep -E 'OpenGL renderer string|Device:|Accelerated:' | sed 's/^/  /'
 }
 
 wait_ready() { # 等 X 服务器可响应
@@ -324,6 +344,7 @@ agentdesk —— 独立无头 X 桌面（不影响真实桌面）
   key <xdotool键名>      如: key ctrl+l / key Return / key alt+Tab
   clip get|set <text>    剪贴板读写（:99 内部）
   service enable|disable|status   systemd --user 常驻自启 + 空闲冻结 timer（无窗口）
+  gpu                    显示 GL 后端实测（AD_GPU=zink 时走 iGPU/Vulkan）
   run <cmd...>           在桌面环境变量下执行任意命令
 EOF
 }
@@ -341,6 +362,7 @@ case "${1:-help}" in
   start) shift; start "$@" ;;
   stop) stop ;;
   status) status ;;
+  gpu) gpu ;;
   watch) shift; watch "${1:-}" ;;
   shot) shift; shot "$@" ;;
   windows) windows ;;
